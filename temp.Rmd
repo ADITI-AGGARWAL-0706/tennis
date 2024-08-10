@@ -1,0 +1,571 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+pacman::p_load(
+  tidyverse, 
+  tidymodels,
+  AppliedPredictiveModeling, 
+  skimr, 
+  janitor, 
+  corrplot, 
+  vip,
+  readxl,
+  magrittr
+)
+```
+
+
+```{r}
+# Set the directory
+directory <- paste0(getwd(), "/tennis_atp")
+pattern <- "atp_matches_\\d{4}\\.csv"
+files <- list.files(directory)
+```
+
+
+```{r}
+# Filter the files using the pattern
+filtered_files <- files[grepl(pattern, files)]
+for (file in filtered_files) {
+  print(file)
+}
+```
+
+
+```{r}
+# Initialize an empty list to store data frames
+dfs <- list()
+
+# Iterate over each file
+for (file in filtered_files) {
+  file_path <- file.path(directory, file)
+  tryCatch({
+    df <- read.csv(file_path)
+    if (length(dfs) > 0) {
+      if (!all(names(df) == names(dfs[[1]]))) {
+        stop(paste("Columns of", file, "do not match previous files."))
+      }
+    }
+    dfs <- append(dfs, list(df))
+  }, error = function(e) {
+    message(paste("Error reading", file, ":", e$message))
+  })
+}
+
+# Combine data frames if there are any valid ones
+if (length(dfs) > 0) {
+  combined_df <- bind_rows(dfs)
+  print(dim(combined_df))
+} else {
+  print("No valid CSV files found.")
+}
+```
+
+
+```{r}
+# Option 1: Remove rows with missing rank data
+cleaned_df <- combined_df %>%
+  filter(!is.na(winner_rank) & !is.na(loser_rank))
+```
+
+
+```{r}
+# Step 2: Initialize Elo Ratings
+initial_elo <- 1500
+elo_ratings <- list()
+```
+
+
+```{r}
+# Step 3: Define a function to calculate Elo ratings
+calculate_elo <- function(winner_elo, loser_elo, k = 32) {
+  expected_winner <- 1 / (1 + 10^((loser_elo - winner_elo) / 400))
+  expected_loser <- 1 - expected_winner
+  
+  updated_winner_elo <- winner_elo + k * (1 - expected_winner)
+  updated_loser_elo <- loser_elo + k * (0 - expected_loser)
+  
+  return(c(updated_winner_elo, updated_loser_elo))
+}
+```
+
+
+```{r}
+# Step 4: Iterate over matches to update Elo ratings
+cleaned_df <- cleaned_df %>%
+  arrange(tourney_date)
+
+# Add new columns for storing Elo ratings
+cleaned_df$winner_elo <- NA
+cleaned_df$loser_elo <- NA
+```
+
+```{r}
+for (i in 1:nrow(cleaned_df)) {
+  winner <- cleaned_df$winner_id[i]
+  loser <- cleaned_df$loser_id[i]
+  
+  # Get current Elo ratings or assign initial if not yet rated
+  winner_elo <- ifelse(!is.null(elo_ratings[[as.character(winner)]]), elo_ratings[[as.character(winner)]], initial_elo)
+  loser_elo <- ifelse(!is.null(elo_ratings[[as.character(loser)]]), elo_ratings[[as.character(loser)]], initial_elo)
+  
+  # Calculate new Elo ratings
+  new_elos <- calculate_elo(winner_elo, loser_elo)
+  
+  # Update Elo ratings
+  elo_ratings[[as.character(winner)]] <- new_elos[1]
+  elo_ratings[[as.character(loser)]] <- new_elos[2]
+  
+  # Store updated ratings in the dataframe
+  cleaned_df$winner_elo[i] <- new_elos[1]
+  cleaned_df$loser_elo[i] <- new_elos[2]
+}
+```
+
+
+```{r}
+# Step 5: Analyze and Visualize Results
+# Example: Plot Elo ratings over time for top players
+top_players <- c(100126, 100185) # Replace with actual IDs
+elo_df <- cleaned_df %>%
+  filter(winner_id %in% top_players | loser_id %in% top_players) %>%
+  select(tourney_date, winner_id, winner_elo, loser_id, loser_elo)
+```
+
+
+```{r}
+elo_df
+```
+
+
+```{r}
+# Melt the data for easier plotting
+elo_df_melted <- melt(elo_df, id.vars = 'tourney_date', 
+                      measure.vars = c('winner_elo', 'loser_elo'),
+                      variable.name = 'player',
+                      value.name = 'elo_rating')
+```
+
+
+```{r}
+# Plot
+ggplot(elo_df_melted, aes(x = tourney_date, y = elo_rating, color = player)) +
+  geom_line() +
+  labs(title = "Elo Ratings Over Time", x = "Date", y = "Elo Rating")
+```
+```{r}
+# Step 1: Predict the winner
+cleaned_df <- cleaned_df %>%
+  mutate(predicted_winner = ifelse(winner_elo > loser_elo, winner_id, loser_id))
+```
+
+
+```{r}
+# Step 2: Compare predicted winner with actual winner
+cleaned_df <- cleaned_df %>%
+  mutate(correct_prediction = ifelse(predicted_winner == winner_id, 1, 0))
+```
+
+
+```{r}
+# Step 3: Calculate accuracy
+accuracy <- mean(cleaned_df$correct_prediction)
+print(paste("Accuracy of the Elo model:", round(accuracy * 100, 2), "%"))
+```
+
+
+```{r}
+# Step 1: Calculate the expected probability for the winner
+cleaned_df <- cleaned_df %>%
+  mutate(winner_prob = 1 / (1 + 10^((loser_elo - winner_elo) / 400)),
+         loser_prob = 1 - winner_prob)
+```
+
+
+```{r}
+# Step 2: Calculate log loss
+cleaned_df <- cleaned_df %>%
+  mutate(log_loss = ifelse(correct_prediction == 1, -log(winner_prob), -log(loser_prob)))
+```
+
+
+```{r}
+log_loss_value <- mean(cleaned_df$log_loss)
+print(paste("Log Loss of the Elo model:", round(log_loss_value, 4)))
+```
+
+
+```{r}
+# Step 1: Create bins of predicted probabilities
+cleaned_df <- cleaned_df %>%
+  mutate(prob_bin = cut(winner_prob, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE))
+```
+
+
+```{r}
+# Step 2: Calculate actual win rate in each bin
+calibration_df <- cleaned_df %>%
+  group_by(prob_bin) %>%
+  summarise(mean_pred_prob = mean(winner_prob),
+            actual_win_rate = mean(correct_prediction))
+```
+
+
+```{r}
+# Step 3: Plot calibration plot
+ggplot(calibration_df, aes(x = mean_pred_prob, y = actual_win_rate)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = "Calibration Plot", x = "Predicted Probability", y = "Actual Win Rate") +
+  theme_minimal()
+```
+```{r}
+
+# Select specific top players
+top_players <- c(100126, 100185) # Replace with actual player IDs
+
+# Filter the data for matches involving top players
+elo_df_top_players <- cleaned_df %>%
+  filter(winner_id %in% top_players | loser_id %in% top_players) %>%
+  mutate(player_id = ifelse(winner_id %in% top_players, winner_id, loser_id),
+         elo_rating = ifelse(winner_id %in% top_players, winner_elo, loser_elo)) %>%
+  select(tourney_date, player_id, elo_rating)
+
+# Convert tourney_date to Date format if it is not already
+elo_df_top_players$tourney_date <- as.Date(as.character(elo_df_top_players$tourney_date), "%Y%m%d")
+
+# Plot Elo ratings over time for selected top players
+ggplot(elo_df_top_players, aes(x = tourney_date, y = elo_rating, color = as.factor(player_id))) +
+  geom_line() +
+  labs(title = "Elo Ratings Over Time for Top Players", 
+       x = "Date", 
+       y = "Elo Rating", 
+       color = "Player ID") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+```
+```{r}
+# Top 50 players based on their highest ranking
+top_50_players <- unique(cleaned_df$winner_id[cleaned_df$winner_rank <= 50])
+
+# Top 100 players based on their highest ranking
+top_100_players <- unique(cleaned_df$winner_id[cleaned_df$winner_rank <= 100])
+
+```
+
+
+```{r}
+# Function to evaluate model performance for a set of players
+evaluate_performance <- function(player_ids, df) {
+  df_filtered <- df %>%
+    filter(winner_id %in% player_ids & loser_id %in% player_ids)
+  
+  accuracy <- mean(df_filtered$correct_prediction)
+  log_loss_value <- mean(df_filtered$log_loss)
+  
+  return(list(accuracy = accuracy, log_loss = log_loss_value))
+}
+
+# Evaluate performance for top 50 players
+performance_top_50 <- evaluate_performance(top_50_players, cleaned_df)
+print(paste("Top 50 - Accuracy:", round(performance_top_50$accuracy * 100, 2), "%"))
+print(paste("Top 50 - Log Loss:", round(performance_top_50$log_loss, 4)))
+
+# Evaluate performance for top 100 players
+performance_top_100 <- evaluate_performance(top_100_players, cleaned_df)
+print(paste("Top 100 - Accuracy:", round(performance_top_100$accuracy * 100, 2), "%"))
+print(paste("Top 100 - Log Loss:", round(performance_top_100$log_loss, 4)))
+
+```
+
+
+# **Part--B**
+
+
+## **Optimize the Elo Model**
+
+```{r}
+# Define the range of K values to test
+k_values <- seq(10, 50, by = 5)  # Adjust the range and step size as needed
+
+# Initialize variables to store the best K and corresponding accuracy
+best_k <- NULL
+best_accuracy <- 0
+
+# Split the data into training and validation sets (e.g., 80/20 split)
+set.seed(42)
+train_index <- sample(seq_len(nrow(cleaned_df)), size = 0.8 * nrow(cleaned_df))
+train_df <- cleaned_df[train_index, ]
+validation_df <- cleaned_df[-train_index, ]
+```
+
+
+```{r}
+# Iterate over different K values
+for (k in k_values) {
+  # Initialize Elo ratings for training
+  elo_ratings <- list()
+  
+  # Iterate over matches in the training set to update Elo ratings
+  for (i in 1:nrow(train_df)) {
+    winner <- train_df$winner_id[i]
+    loser <- train_df$loser_id[i]
+    
+    winner_elo <- ifelse(!is.null(elo_ratings[[as.character(winner)]]), elo_ratings[[as.character(winner)]], initial_elo)
+    loser_elo <- ifelse(!is.null(elo_ratings[[as.character(loser)]]), elo_ratings[[as.character(loser)]], initial_elo)
+    
+    new_elos <- calculate_elo(winner_elo, loser_elo, k)
+    
+    elo_ratings[[as.character(winner)]] <- new_elos[1]
+    elo_ratings[[as.character(loser)]] <- new_elos[2]
+  }
+  
+  # Predict outcomes on the validation set
+  validation_df <- validation_df %>%
+    mutate(predicted_winner = ifelse(winner_elo > loser_elo, winner_id, loser_id)) %>%
+    mutate(correct_prediction = ifelse(predicted_winner == winner_id, 1, 0))
+  
+  # Calculate accuracy on the validation set
+  accuracy <- mean(validation_df$correct_prediction)
+  
+  # Update best K if this K value performs better
+  if (accuracy > best_accuracy) {
+    best_k <- k
+    best_accuracy <- accuracy
+  }
+}
+```
+
+```{r}
+print(paste("Best K:", best_k, "with accuracy:", round(best_accuracy * 100, 2), "%"))
+```
+
+
+```{r}
+# Filter for non-missing rank data
+cleaned_df <- combined_df %>%
+  filter(!is.na(winner_rank) & !is.na(loser_rank)) %>%
+  arrange(tourney_date)
+```
+
+
+```{r}
+calculate_elo_538 <- function(winner_elo, loser_elo, K = 32, delta = 0, nu = 1, sigma = 0) {
+  expected_winner <- 1 / (1 + 10^((loser_elo - winner_elo + delta + sigma) / 400))
+  expected_loser <- 1 - expected_winner
+  
+  updated_winner_elo <- winner_elo + K * nu * (1 - expected_winner)
+  updated_loser_elo <- loser_elo + K * nu * (0 - expected_loser)
+  
+  return(c(updated_winner_elo, updated_loser_elo))
+}
+```
+
+```{r}
+# Initialize Elo ratings
+initial_elo <- 1500
+elo_ratings <- list()
+
+# Add new columns for storing Elo ratings
+cleaned_df$winner_elo <- NA
+cleaned_df$loser_elo <- NA
+
+# Iterate over the matches
+for (i in 1:nrow(cleaned_df)) {
+  winner <- cleaned_df$winner_id[i]
+  loser <- cleaned_df$loser_id[i]
+  
+  # Get current Elo ratings or assign initial if not yet rated
+  winner_elo <- ifelse(!is.null(elo_ratings[[as.character(winner)]]), elo_ratings[[as.character(winner)]], initial_elo)
+  loser_elo <- ifelse(!is.null(elo_ratings[[as.character(loser)]]), elo_ratings[[as.character(loser)]], initial_elo)
+  
+  # Calculate new Elo ratings with the 538 update
+  new_elos <- calculate_elo_538(winner_elo, loser_elo, K = 32, delta = 0, nu = 1, sigma = 0)
+  
+  # Update Elo ratings
+  elo_ratings[[as.character(winner)]] <- new_elos[1]
+  elo_ratings[[as.character(loser)]] <- new_elos[2]
+  
+  # Store updated ratings in the dataframe
+  cleaned_df$winner_elo[i] <- new_elos[1]
+  cleaned_df$loser_elo[i] <- new_elos[2]
+}
+```
+
+```{r}
+# Define a grid of parameters to search over
+param_grid <- expand.grid(
+  K = seq(20, 40, by = 10),
+  delta = seq(-50, 50, by = 20),
+  nu = seq(1, 2, by = 1),
+  sigma = seq(-100, 100, by = 40)
+)
+
+# Function to evaluate model performance based on a parameter set
+evaluate_model <- function(params, df) {
+  K <- params$K
+  delta <- params$delta
+  nu <- params$nu
+  sigma <- params$sigma
+  
+  elo_ratings <- list()
+  df$winner_elo <- NA
+  df$loser_elo <- NA
+  
+  for (i in 1:nrow(df)) {
+    winner <- df$winner_id[i]
+    loser <- df$loser_id[i]
+    
+    winner_elo <- ifelse(!is.null(elo_ratings[[as.character(winner)]]), elo_ratings[[as.character(winner)]], 1500)
+    loser_elo <- ifelse(!is.null(elo_ratings[[as.character(loser)]]), elo_ratings[[as.character(loser)]], 1500)
+    
+    new_elos <- calculate_elo_538(winner_elo, loser_elo, K, delta, nu, sigma)
+    
+    elo_ratings[[as.character(winner)]] <- new_elos[1]
+    elo_ratings[[as.character(loser)]] <- new_elos[2]
+    
+    df$winner_elo[i] <- new_elos[1]
+    df$loser_elo[i] <- new_elos[2]
+  }
+  
+  df <- df %>%
+    mutate(predicted_winner = ifelse(winner_elo > loser_elo, winner_id, loser_id),
+           correct_prediction = ifelse(predicted_winner == winner_id, 1, 0),
+           winner_prob = 1 / (1 + 10^((loser_elo - winner_elo) / 400)),
+           loser_prob = 1 - winner_prob,
+           log_loss = ifelse(correct_prediction == 1, -log(winner_prob), -log(loser_prob)))
+  
+  accuracy <- mean(df$correct_prediction)
+  log_loss_value <- mean(df$log_loss)
+  
+  return(list(accuracy = accuracy, log_loss = log_loss_value))
+}
+```
+
+
+```{r}
+library(parallel)
+
+# Random search: Select a subset of the grid
+set.seed(42)  # For reproducibility
+num_random_combinations <- 50
+random_indices <- sample(seq_len(nrow(param_grid)), num_random_combinations)
+random_grid <- param_grid[random_indices,]
+
+# Step 2: Sample a smaller dataset for quicker testing
+sampled_df <- cleaned_df %>% sample_frac(0.1)
+
+# Step 3: Create a parallel cluster
+num_cores <- detectCores() - 1  # Leave one core free
+cl <- makeCluster(num_cores)
+
+clusterEvalQ(cl, {
+  library(dplyr)
+  library(magrittr)
+})
+
+# Step 4: Export necessary objects to the cluster
+clusterExport(cl, list("random_grid", "evaluate_model", "sampled_df", "calculate_elo_538"))
+```
+
+```{r}
+# Step 5: Run the parameter search in parallel
+results <- parLapply(cl, seq_len(nrow(random_grid)), function(i) {
+  params <- random_grid[i,]
+  perf <- evaluate_model(params, sampled_df)  # Use the sampled dataset
+  return(c(params, perf$accuracy, perf$log_loss))
+})
+```
+
+```{r}
+# Step 6: Stop the cluster
+stopCluster(cl)
+```
+
+```{r}
+results_df <- do.call(rbind, results)
+colnames(results_df) <- c(names(param_grid), "accuracy", "log_loss")
+print(results_df)
+```
+
+
+
+```{r}
+results_df <- as.data.frame(results_df)
+colnames(results_df) <- c("K", "delta", "nu", "sigma", "accuracy", "log_loss")
+
+# Convert relevant columns to numeric
+results_df$accuracy <- as.numeric(as.character(results_df$accuracy))
+results_df$log_loss <- as.numeric(as.character(results_df$log_loss))
+results_df$K <- as.numeric(as.character(results_df$K))
+results_df$delta <- as.numeric(as.character(results_df$delta))
+results_df$nu <- as.numeric(as.character(results_df$nu))
+results_df$sigma <- as.numeric(as.character(results_df$sigma))
+
+
+library(ggplot2)
+
+# Scatter plot of accuracy vs log_loss
+ggplot(results_df, aes(x = log_loss, y = accuracy, color = K, shape = factor(nu))) +
+  geom_point(size = 3) +
+  labs(title = "Accuracy vs Log Loss for Different Hyperparameter Combinations",
+       x = "Log Loss",
+       y = "Accuracy",
+       color = "K Value",
+       shape = "Nu Value") +
+  theme_minimal()
+
+ggplot(results_df, aes(x = K, y = accuracy, group = 1)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Accuracy vs K Value",
+       x = "K Value",
+       y = "Accuracy") +
+  theme_minimal()
+
+ggplot(results_df, aes(x = delta, y = accuracy, group = 1)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Accuracy vs Delta Value",
+       x = "Delta",
+       y = "Accuracy") +
+  theme_minimal()
+
+ggplot(results_df, aes(x = nu, y = accuracy, group = 1)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Accuracy vs Nu Value",
+       x = "Nu",
+       y = "Accuracy") +
+  theme_minimal()
+
+
+ggplot(results_df, aes(x = sigma, y = accuracy, group = 1)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Accuracy vs Sigma Value",
+       x = "Sigma",
+       y = "Accuracy") +
+  theme_minimal()
+
+
+```
+
+```{r}
+```
+
+
+```{r}
+```
+
+```{r}
+```
+
+
+```{r}
+```
